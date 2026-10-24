@@ -27,6 +27,15 @@ type stdioCommandTransport struct {
 	observation           *ProtocolObservation
 	observationGeneration string
 
+	// credentialResolver, when non-nil, is called with the credential file
+	// basename to obtain the credential bytes for the child environment.
+	// It must implement the full security chain (trusted root verification,
+	// openat2 atomic open, bounded read, 0600/uid checks). In production
+	// this is nil until a trusted executable checksum baseline exists;
+	// when nil, any binding with a non-empty CredentialFile is refused
+	// fail-closed before the child process is started.
+	credentialResolver func(credentialFile string) ([]byte, error)
+
 	mu        sync.Mutex
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
@@ -35,6 +44,7 @@ type stdioCommandTransport struct {
 	waitDone  chan error
 	signals   chan os.Signal
 	started   bool
+	startFailed bool
 	stopping  bool
 
 	commandLabel string
@@ -96,6 +106,21 @@ func (t *stdioCommandTransport) Transport(cfg *runtimeconfig.MCPConfig) (*mcp.IO
 	}
 	cmd.Stderr = os.Stderr
 
+	// --- Credential injection (fail-closed) ---------------------------------
+	// If a credential file is bound to this channel, build a minimal cmd.Env
+	// whitelist containing only PATH, HOME, and RELAY_TOKEN. Any failure in
+	// this block returns before cmd.Start() so the child is never started
+	// with an incomplete or unverified credential. The pipes created above
+	// are always closed on failure to avoid leaking fds.
+	if cfg.CredentialFile != "" {
+		if err := applyCredentialEnv(cmd, cfg, t.credentialResolver); err != nil {
+			_ = stdin.Close()
+			_ = stdout.Close()
+			return nil, err
+		}
+	}
+	// ------------------------------------------------------------------------
+
 	t.cmd = cmd
 	t.stdin = stdin
 	t.stdout = stdout
@@ -138,15 +163,33 @@ func (t *stdioCommandTransport) start(ctx context.Context) error {
 		return nil
 	}
 	t.started = true
-	t.observationGeneration = t.observation.beginChild()
-	generation := t.observationGeneration
+	var generation string
+	if t.observation != nil {
+		generation = t.observation.beginChild()
+	}
+	t.observationGeneration = generation
 	t.mu.Unlock()
 
 	if err := cmd.Start(); err != nil {
-		t.observation.childClosed(generation, "child_start_failed")
+		// Close the pipes to avoid leaking fds when the child never starts.
+		_ = t.stdin.Close()
+		_ = t.stdout.Close()
+
+		// Mark the start as failed so stop() does not block on waitDone,
+		// which is only populated by waitForExit on a successful start.
+		t.mu.Lock()
+		t.startFailed = true
+		t.started = false
+		t.mu.Unlock()
+
+		if t.observation != nil {
+			t.observation.childClosed(generation, "child_start_failed")
+		}
 		return fmt.Errorf("mcpclient: start stdio command: %w", err)
 	}
-	t.observation.childStarted(generation)
+	if t.observation != nil {
+		t.observation.childStarted(generation)
+	}
 
 	t.logInfo(ctx, "stdio MCP command started", slog.String("command", t.commandLabel))
 	t.startSignalForwarding()
@@ -163,10 +206,22 @@ func (t *stdioCommandTransport) stop(ctx context.Context) error {
 	waitDone := t.waitDone
 	stdin := t.stdin
 	started := t.started
+	startFailed := t.startFailed
 	if started {
 		t.stopping = true
 	}
 	t.mu.Unlock()
+
+	// If a previous start() attempt failed after cmd.Start(), the process
+	// was never actually spawned: waitForExit was not launched, so waitDone
+	// will never receive a value. Return promptly instead of blocking on
+	// ctx.Done().
+	if startFailed {
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+		return nil
+	}
 
 	if cmd == nil || !started {
 		return nil
@@ -247,9 +302,12 @@ func (t *stdioCommandTransport) requestShutdown(reason string, cause error) {
 
 func (t *stdioCommandTransport) closeObservation(reason string) {
 	t.mu.Lock()
+	observation := t.observation
 	generation := t.observationGeneration
 	t.mu.Unlock()
-	t.observation.childClosed(generation, reason)
+	if observation != nil {
+		observation.childClosed(generation, reason)
+	}
 }
 
 func (t *stdioCommandTransport) startSignalForwarding() {

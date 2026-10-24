@@ -73,8 +73,10 @@ func (p stdioTransportProvider) Build(params TransportBuildParams) (mcp.Transpor
 		return nil, errors.New("mcpclient: stdio transport requires mcp.command")
 	}
 	commandConfig := &runtimeconfig.MCPConfig{
-		Command:     params.Binding.Command,
-		CommandArgs: params.Binding.CommandArgs,
+		Command:           params.Binding.Command,
+		CommandArgs:       params.Binding.CommandArgs,
+		CredentialFile:    params.Binding.CredentialFile,
+		CredentialCommand: params.Binding.CredentialCommand,
 	}
 	transport, err := p.commandFactory.transportForChannel(params.Binding.Channel).Transport(commandConfig)
 	if err != nil {
