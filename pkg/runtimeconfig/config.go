@@ -385,6 +385,16 @@ type MCPConfig struct {
 	TransportKind       MCPTransportKind
 	ClientCertificate   *tlsconfig.ClientCertificate
 	ChannelBindings     []MCPChannelBinding
+	// CredentialFile is the basename of the credential file bound to the main
+	// stdio channel. It mirrors MCPChannelBinding.CredentialFile for the
+	// main-channel binding so that transport construction (which receives
+	// *MCPConfig, not *MCPChannelBinding) has direct access to it.
+	// Empty means no credential is bound; the stdio child inherits the
+	// parent environment as before.
+	CredentialFile string
+	// CredentialCommand is the expected executable basename that must match
+	// filepath.Base(CommandArgs[0]) before credential injection is allowed.
+	CredentialCommand string
 	// AllowNoMain is set only for an explicit poll allowlist that excludes main.
 	// It keeps zero-value MCPConfig compatibility for older callers.
 	AllowNoMain bool
@@ -464,6 +474,23 @@ type MCPChannelBinding struct {
 	ClientCertificate *tlsconfig.ClientCertificate
 	HTTPProxy         *url.URL
 	HTTPProxySource   ProxySource
+	// CredentialFile is a single basename (no path separators, no "..", no
+	// "env:" prefix) that names the credential file inside a trusted 0700
+	// credentials root. Empty means no credential is bound to this channel;
+	// the stdio child process then inherits the parent environment as before.
+	// The token value itself is NEVER stored in this field or in any config
+	// file — only the file basename is persisted.
+	CredentialFile string
+	// CredentialCommand is the expected basename of the stdio executable
+	// (filepath.Base of CommandArgs[0]). When CredentialFile is non-empty,
+	// the binding is refused at config-parse time unless CredentialCommand
+	// is also set AND matches the actual executable basename at transport
+	// construction time. This is a defense-in-depth measure: it does not
+	// replace the requirement for a trusted executable checksum (which is
+	// not yet available) and is NOT a substitute for it — it only prevents
+	// a misconfigured binding from accidentally injecting a token into the
+	// wrong process.
+	CredentialCommand string
 }
 
 // ChannelBindingFor returns the configured binding for the provided channel.
@@ -2157,6 +2184,8 @@ func buildMCPConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), gl
 		cfg.CommandArgs = mainBinding.CommandArgs
 		cfg.TransportKind = mainBinding.TransportKind
 		cfg.ClientCertificate = mainBinding.ClientCertificate
+		cfg.CredentialFile = mainBinding.CredentialFile
+		cfg.CredentialCommand = mainBinding.CredentialCommand
 	}
 	return cfg, nil
 }
@@ -2271,7 +2300,7 @@ func parseMCPBindingEntry(entry string, kind MCPTransportKind, lookupEnv func(st
 	}
 
 	if kind == MCPTransportStdio {
-		return parseQualifiedStdioMCPBindingEntry(entry)
+		return parseQualifiedStdioMCPBindingEntry(entry, lookupEnv)
 	}
 
 	parts := strings.Split(entry, ",")
@@ -2305,6 +2334,8 @@ func parseMCPBindingEntry(entry string, kind MCPTransportKind, lookupEnv func(st
 		allowedKeys["client-key"] = true
 	case MCPTransportStdio:
 		allowedKeys["command"] = true
+		allowedKeys["credential"] = true
+		allowedKeys["credential-command"] = true
 	}
 	for key := range values {
 		if !allowedKeys[key] {
@@ -2373,54 +2404,242 @@ func parseMCPBindingEntry(entry string, kind MCPTransportKind, lookupEnv func(st
 		if !ok {
 			return MCPChannelBinding{}, fmt.Errorf("mcp config: command entry %q missing command", entry)
 		}
-		return buildMCPBinding(channel, kind, rawCommand)
+		binding, err := buildMCPBinding(channel, kind, rawCommand)
+		if err != nil {
+			return MCPChannelBinding{}, err
+		}
+		if rawCred, ok := values["credential"]; ok {
+			cred, err := validateCredentialBasename(rawCred)
+			if err != nil {
+				return MCPChannelBinding{}, fmt.Errorf("mcp config: credential in entry %q: %w", entry, err)
+			}
+			binding.CredentialFile = cred
+		}
+		if rawCredCmd, ok := values["credential-command"]; ok {
+			cmd, err := validateCredentialBasename(rawCredCmd)
+			if err != nil {
+				return MCPChannelBinding{}, fmt.Errorf("mcp config: credential-command in entry %q: %w", entry, err)
+			}
+			binding.CredentialCommand = cmd
+		}
+		// Fail-closed at config-parse time: if a credential is bound, the
+		// credential-command must also be present. This prevents a binding
+		// from being constructed that would later inject a token without
+		// the executable-identity cross-check.
+		if binding.CredentialFile != "" && binding.CredentialCommand == "" {
+			return MCPChannelBinding{}, fmt.Errorf("mcp config: entry %q has credential but no credential-command; refusing to construct binding", entry)
+		}
+		return binding, nil
 	default:
 		return MCPChannelBinding{}, fmt.Errorf("mcp config: unsupported transport %q", kind)
 	}
 }
-
-func parseQualifiedStdioMCPBindingEntry(entry string) (MCPChannelBinding, error) {
+func parseQualifiedStdioMCPBindingEntry(entry string, lookupEnv func(string) (string, bool)) (MCPChannelBinding, error) {
 	trimmed := strings.TrimSpace(entry)
 	channelName := ""
 	rawCommand := ""
 
 	switch {
 	case strings.HasPrefix(trimmed, "channel="):
+		// Preserve legacy semantics: the FIRST comma separates the channel
+		// value from the remaining segments. The command= segment owns a
+		// contiguous run that may embed commas; credential / credential-
+		// command segments are key=value pairs that can appear before or
+		// after command=.
 		comma := strings.Index(trimmed, ",")
 		if comma < 0 {
 			return MCPChannelBinding{}, fmt.Errorf("mcp config: command entry %q missing command", entry)
 		}
 		channelName = strings.TrimSpace(strings.TrimPrefix(trimmed[:comma], "channel="))
-		rest := strings.TrimSpace(trimmed[comma+1:])
-		if !strings.HasPrefix(rest, "command=") {
+		if channelName == "" {
+			return MCPChannelBinding{}, fmt.Errorf("mcp config: invalid entry %q (channel= requires a value)", entry)
+		}
+		rest := trimmed[comma+1:]
+
+		// Locate the command= segment. Its value runs up to the next
+		// top-level non-command key=value segment (or end of entry), so
+		// embedded commas inside the command value survive.
+		cmdIdx := strings.Index(rest, "command=")
+		if cmdIdx < 0 {
 			return MCPChannelBinding{}, fmt.Errorf("mcp config: invalid entry %q (expected command=...)", entry)
 		}
-		rawCommand = strings.TrimSpace(strings.TrimPrefix(rest, "command="))
+		preceding := rest[:cmdIdx]
+		preceding = strings.TrimRight(preceding, ",")
+
+		// Determine the command value extent: it ends at the next
+		// occurrence of a ",key=" pattern where key is a known
+		// non-command segment, or at end of entry.
+		cmdValueEnd := len(rest)
+		for _, key := range []string{"credential=", "credential-command="} {
+			if idx := strings.Index(rest[cmdIdx+len("command="):], ","+strings.TrimSuffix(key, "=")); idx >= 0 {
+				absIdx := cmdIdx + len("command=") + idx
+				if absIdx < cmdValueEnd {
+					cmdValueEnd = absIdx
+				}
+			}
+		}
+		cmdValue := rest[cmdIdx+len("command=") : cmdValueEnd]
+		if strings.TrimSpace(cmdValue) == "" {
+			return MCPChannelBinding{}, fmt.Errorf("mcp config: command entry %q missing command value", entry)
+		}
+		rawCommand = strings.TrimSpace(cmdValue)
+
+		// Collect and validate the credential / credential-command
+		// segments that precede command= ...
+		var rawCredential, rawCredentialCmd string
+		hasCredential := false
+		precedingSegs := preceding
+		if precedingSegs != "" {
+			for _, seg := range strings.Split(precedingSegs, ",") {
+				seg = strings.TrimSpace(seg)
+				if seg == "" {
+					continue
+				}
+				kv, err := parseCredentialSegment(seg, entry)
+				if err != nil {
+					return MCPChannelBinding{}, err
+				}
+				if kv.key == "credential" {
+					if rawCredential != "" {
+						return MCPChannelBinding{}, fmt.Errorf("mcp config: duplicate credential key in entry %q", entry)
+					}
+					rawCredential = kv.value
+					hasCredential = true
+				} else {
+					if rawCredentialCmd != "" {
+						return MCPChannelBinding{}, fmt.Errorf("mcp config: duplicate credential-command key in entry %q", entry)
+					}
+					rawCredentialCmd = kv.value
+					hasCredential = true
+				}
+			}
+		}
+		// ... and those that follow command= (up to end of entry).
+		if cmdValueEnd < len(rest) {
+			following := rest[cmdValueEnd:]
+			following = strings.TrimLeft(following, ",")
+			for _, seg := range strings.Split(following, ",") {
+				seg = strings.TrimSpace(seg)
+				if seg == "" {
+					continue
+				}
+				kv, err := parseCredentialSegment(seg, entry)
+				if err != nil {
+					return MCPChannelBinding{}, err
+				}
+				if kv.key == "credential" {
+					if rawCredential != "" {
+						return MCPChannelBinding{}, fmt.Errorf("mcp config: duplicate credential key in entry %q", entry)
+					}
+					rawCredential = kv.value
+					hasCredential = true
+				} else {
+					if rawCredentialCmd != "" {
+						return MCPChannelBinding{}, fmt.Errorf("mcp config: duplicate credential-command key in entry %q", entry)
+					}
+					rawCredentialCmd = kv.value
+					hasCredential = true
+				}
+			}
+		}
+
+		if err := rejectUnsupportedQualifiedStdioSegments(rawCommand, entry); err != nil {
+			return MCPChannelBinding{}, err
+		}
+		if hasCredential {
+			return sharedValueStdioBinding(channelName, rawCommand, rawCredential, rawCredentialCmd, entry)
+		}
+		channel, err := types.NormalizeChannel(channelName)
+		if err != nil {
+			return MCPChannelBinding{}, err
+		}
+		return buildMCPBinding(channel, MCPTransportStdio, rawCommand)
 	case strings.HasPrefix(trimmed, "command="):
 		rawCommand = strings.TrimSpace(strings.TrimPrefix(trimmed, "command="))
 		if comma := strings.LastIndex(rawCommand, ",channel="); comma >= 0 {
 			channelName = strings.TrimSpace(rawCommand[comma+len(",channel="):])
 			rawCommand = strings.TrimSpace(rawCommand[:comma])
 		}
+		if err := rejectUnsupportedQualifiedStdioSegments(rawCommand, entry); err != nil {
+			return MCPChannelBinding{}, err
+		}
+		channel, err := types.NormalizeChannel(channelName)
+		if err != nil {
+			return MCPChannelBinding{}, err
+		}
+		return buildMCPBinding(channel, MCPTransportStdio, rawCommand)
 	default:
 		return MCPChannelBinding{}, fmt.Errorf("mcp config: invalid entry %q (expected channel=... or command=...)", entry)
 	}
+}
 
-	if channelName == "" {
-		channelName = "main"
-	}
-	if rawCommand == "" {
-		return MCPChannelBinding{}, fmt.Errorf("mcp config: command entry %q missing command", entry)
-	}
-	if err := rejectUnsupportedQualifiedStdioSegments(rawCommand, entry); err != nil {
-		return MCPChannelBinding{}, err
-	}
-
+// sharedValueStdioBinding is the shared credential-aware path used by both
+// parseQualifiedStdioMCPBindingEntry and parseMCPBindingEntry. It applies
+// basename validation, the credential-command requirement, and fail-closed
+// refusal uniformly.
+func sharedValueStdioBinding(channelName, rawCommand, rawCredential, rawCredentialCmd, entry string) (MCPChannelBinding, error) {
 	channel, err := types.NormalizeChannel(channelName)
 	if err != nil {
 		return MCPChannelBinding{}, err
 	}
-	return buildMCPBinding(channel, MCPTransportStdio, rawCommand)
+	binding, err := buildMCPBinding(channel, MCPTransportStdio, rawCommand)
+	if err != nil {
+		return MCPChannelBinding{}, err
+	}
+	if rawCredential != "" {
+		cred, err := validateCredentialBasename(rawCredential)
+		if err != nil {
+			return MCPChannelBinding{}, fmt.Errorf("mcp config: credential in entry %q: %w", entry, err)
+		}
+		binding.CredentialFile = cred
+	}
+	if rawCredentialCmd != "" {
+		cmd, err := validateCredentialBasename(rawCredentialCmd)
+		if err != nil {
+			return MCPChannelBinding{}, fmt.Errorf("mcp config: credential-command in entry %q: %w", entry, err)
+		}
+		binding.CredentialCommand = cmd
+	}
+	if binding.CredentialFile != "" && binding.CredentialCommand == "" {
+		return MCPChannelBinding{}, fmt.Errorf("mcp config: entry %q has credential but no credential-command; refusing to construct binding", entry)
+	}
+	return binding, nil
+}
+
+// parseCredentialSegment validates a single non-command key=value segment in a
+// qualified stdio binding entry. Only credential and credential-command keys
+// are accepted; any other key is rejected.
+func parseCredentialSegment(seg, entry string) (struct {
+	key   string
+	value string
+}, error) {
+	kv := strings.SplitN(seg, "=", 2)
+	if len(kv) != 2 {
+		return struct {
+			key   string
+			value string
+		}{}, fmt.Errorf("mcp config: invalid segment %q in entry %q", seg, entry)
+	}
+	key := strings.TrimSpace(kv[0])
+	value := strings.TrimSpace(kv[1])
+	if value == "" {
+		return struct {
+			key   string
+			value string
+		}{}, fmt.Errorf("mcp config: empty value for %q in entry %q", key, entry)
+	}
+	switch key {
+	case "credential", "credential-command":
+		return struct {
+			key   string
+			value string
+		}{key: key, value: value}, nil
+	default:
+		return struct {
+			key   string
+			value string
+		}{}, fmt.Errorf("mcp config: unsupported key %q in entry %q", key, entry)
+	}
 }
 
 func rejectUnsupportedQualifiedStdioSegments(rawCommand, entry string) error {
@@ -2430,6 +2649,34 @@ func rejectUnsupportedQualifiedStdioSegments(rawCommand, entry string) error {
 		}
 	}
 	return nil
+}
+
+// validateCredentialBasename checks that raw is a safe, single-component
+// basename suitable for use as a credential file name or expected command
+// basename. It rejects:
+//   - empty / whitespace-only strings
+//   - "." and ".."
+//   - any string containing a path separator
+//   - any string containing "env:" prefix (credential must not be an env ref)
+//   - any string starting or ending with whitespace (after trim check)
+func validateCredentialBasename(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("value is empty")
+	}
+	if trimmed == "." || trimmed == ".." {
+		return "", fmt.Errorf("value %q is a path dot-segment", trimmed)
+	}
+	if strings.ContainsRune(trimmed, '/') {
+		return "", fmt.Errorf("value %q contains a path separator", trimmed)
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "env:") {
+		return "", fmt.Errorf("value %q uses an env: reference; credential values must be bare basenames", trimmed)
+	}
+	if len(trimmed) > 255 {
+		return "", fmt.Errorf("value is too long (%d bytes, max 255)", len(trimmed))
+	}
+	return trimmed, nil
 }
 
 func buildMCPBinding(channel types.Channel, kind MCPTransportKind, rawValue string) (MCPChannelBinding, error) {
@@ -2452,6 +2699,9 @@ func buildMCPBinding(channel types.Channel, kind MCPTransportKind, rawValue stri
 		}
 		binding.Command = rawValue
 		binding.CommandArgs = parsed
+		// Credential fields are passed through via the extra-values map;
+		// buildMCPBinding receives them via a dedicated helper because the
+		// raw command value is a single string, not a key/value map.
 	default:
 		return MCPChannelBinding{}, fmt.Errorf("unsupported mcp transport %q", kind)
 	}

@@ -110,12 +110,14 @@ func newMcpClient(p clientParams) (clientOutputs, error) {
 	}
 	if mainBinding == nil {
 		legacyBinding := runtimeconfig.MCPChannelBinding{
-			Channel:        types.DefaultChannel,
-			TransportKind:  p.Config.TransportKind,
-			ServerURL:      p.Config.ServerURL,
-			UnixSocketPath: p.Config.UnixSocketPath,
-			Command:        p.Config.Command,
-			CommandArgs:    p.Config.CommandArgs,
+			Channel:           types.DefaultChannel,
+			TransportKind:     p.Config.TransportKind,
+			ServerURL:         p.Config.ServerURL,
+			UnixSocketPath:    p.Config.UnixSocketPath,
+			Command:           p.Config.Command,
+			CommandArgs:       p.Config.CommandArgs,
+			CredentialFile:    p.Config.CredentialFile,
+			CredentialCommand: p.Config.CredentialCommand,
 		}
 		mainBinding = &legacyBinding
 	}

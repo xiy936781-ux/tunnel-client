@@ -101,11 +101,13 @@ func newConfiguredChannelBindings(cfg *runtimeconfig.MCPConfig, factory *mcpclie
 	channelBindings := cfg.ChannelBindings
 	if len(channelBindings) == 0 && !cfg.AllowNoMain {
 		mainBinding := runtimeconfig.MCPChannelBinding{
-			Channel:       types.DefaultChannel,
-			TransportKind: cfg.TransportKind,
-			ServerURL:     cfg.ServerURL,
-			Command:       cfg.Command,
-			CommandArgs:   cfg.CommandArgs,
+			Channel:           types.DefaultChannel,
+			TransportKind:     cfg.TransportKind,
+			ServerURL:         cfg.ServerURL,
+			Command:           cfg.Command,
+			CommandArgs:       cfg.CommandArgs,
+			CredentialFile:    cfg.CredentialFile,
+			CredentialCommand: cfg.CredentialCommand,
 		}
 		channelBindings = []runtimeconfig.MCPChannelBinding{mainBinding}
 	}

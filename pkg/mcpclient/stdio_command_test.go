@@ -191,6 +191,36 @@ func TestStdioCommandTransportRuntimeInfo(t *testing.T) {
 	require.NoError(t, stop())
 }
 
+func TestStdioCommandTransportStopReturnsPromptlyAfterStartFailure(t *testing.T) {
+	t.Parallel()
+
+	lifecycle := &stubLifecycle{}
+	shutdowner := &stubShutdowner{}
+	transport := newStdioCommandTransport(slog.New(slog.NewTextHandler(io.Discard, nil)), lifecycle, shutdowner)
+
+	// Use a non-existent executable so that cmd.Start() fails and
+	// waitForExit is never launched. On a successful start the test would
+	// not exercise the regression path.
+	cfg := &config.MCPConfig{
+		Command:     "nonexistent-executable-xyz",
+		CommandArgs: []string{"nonexistent-executable-xyz"},
+	}
+	_, err := transport.Transport(cfg)
+	require.NoError(t, err, "Transport should succeed even if the command later fails to start")
+	require.Len(t, lifecycle.hooks, 1)
+
+	hook := lifecycle.hooks[0]
+	require.Error(t, hook.OnStart(context.Background()),
+		"OnStart must fail because the executable does not exist")
+
+	// The regression: stop() must return promptly even when start() failed.
+	// It must NOT block until ctx is cancelled.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stopErr := hook.OnStop(ctx)
+	require.NoError(t, stopErr, "stop() after a start failure must return nil promptly")
+}
+
 func startStdioCommand(t *testing.T, hook fx.Hook) func() error {
 	t.Helper()
 	require.NoError(t, hook.OnStart(context.Background()))
