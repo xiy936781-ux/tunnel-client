@@ -53,7 +53,7 @@ func openCredentialLinux(rootDir *os.Root, credentialFile string, rootInfo os.Fi
 	}
 
 	how := &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW,
+		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK,
 		Mode:    0,
 		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS,
 	}
