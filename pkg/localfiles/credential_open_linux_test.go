@@ -102,6 +102,8 @@ func TestOpenCredentialRejectsFIFO(t *testing.T) {
 
 	if _, err := OpenCredential(root, "fifo"); err == nil {
 		t.Fatal("expected error for FIFO, got nil")
+	} else if !strings.Contains(err.Error(), "must be a regular file") {
+		t.Fatalf("expected rejection for non-regular file, got: %v", err)
 	}
 }
 
